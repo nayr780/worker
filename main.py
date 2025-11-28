@@ -9,11 +9,10 @@ DEV (local):
     - Tudo em um terminal só
 
 RENDER (produção):
-    Start Command:
+    Start Command (recomendado):
+        python main.py   (web service com / status)
+    ou, se usar Background Worker:
         arq main.WorkerSettings
-
-    - O próprio ARQ importa main.WorkerSettings
-    - Nosso on_startup sobe o proxy redis_ws_tcp_proxy dentro do worker
 """
 
 import os
@@ -58,7 +57,7 @@ logger = logging.getLogger("iss-automacao-notas")
 # ID do worker (para health check) — pode ser fixado via env se quiser
 WORKER_ID = os.getenv("WORKER_ID") or uuid.uuid4().hex[:6]
 
-# Coisas gerais do ambiente/Playwright (mantive via env porque não tem a ver com ARQ)
+# Coisas gerais do ambiente/Playwright
 HEADLESS = os.getenv("HEADLESS", "true").strip().lower() in ("true", "1", "yes")
 BASE_DIR = os.getenv("BASE_DIR", "./saidas")
 IS_RENDER = bool(os.getenv("RENDER_SERVICE_ID") or os.getenv("RENDER"))
@@ -71,6 +70,10 @@ MAX_TASK_TIMEOUT_SEC = int(os.getenv("MAX_TASK_TIMEOUT_SEC", "800"))
 # Namespace de logs no Redis (por job)
 REDIS_LOG_NS = os.getenv("REDIS_LOG_NS", "iss")
 
+# Porta HTTP para o health-check (Render usa $PORT)
+STATUS_HOST = "0.0.0.0"
+STATUS_PORT = int(os.getenv("PORT", "0"))  # se não tiver PORT, status fica desativado
+
 # Estado compartilhado para os flows (apenas informativo/telemetria)
 current_state: dict[str, Any] = {
     "fase": "",
@@ -78,7 +81,6 @@ current_state: dict[str, Any] = {
     "escrituracao_reaberta": False,
     "passou_encerramento": False,
 }
-
 
 # ============================================================
 # Helpers simples
@@ -452,7 +454,7 @@ PROXY_PORT = int(os.getenv(
     getattr(redis_ws_tcp_proxy, "LOCAL_PORT", 6380),
 ))
 
-# Atuliza o módulo do proxy com o que vier do env
+# Atualiza o módulo do proxy com o que vier do env
 redis_ws_tcp_proxy.WS_URL = REDIS_WS_URL
 redis_ws_tcp_proxy.TOKEN = REDIS_TOKEN
 redis_ws_tcp_proxy.LOCAL_HOST = PROXY_HOST
@@ -472,6 +474,7 @@ REDIS_SETTINGS = RedisSettings(
 # ============================================================
 
 _proxy_task: Optional[asyncio.Task] = None
+_status_task: Optional[asyncio.Task] = None
 
 
 async def _wait_for_port(host: str, port: int, timeout: float = 10.0):
@@ -488,15 +491,66 @@ async def _wait_for_port(host: str, port: int, timeout: float = 10.0):
             await asyncio.sleep(0.15)
 
 
+# ============================================================
+# HTTP status server (health-check / Render)
+# ============================================================
+
+async def _status_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        # lê mas ignora o request
+        await reader.read(1024)
+    except Exception:
+        pass
+
+    body = b"OK"
+    headers = [
+        b"HTTP/1.1 200 OK",
+        b"Content-Type: text/plain; charset=utf-8",
+        f"Content-Length: {len(body)}".encode("ascii"),
+        b"Connection: close",
+        b"",
+        b"",
+    ]
+    resp = b"\r\n".join(headers) + body
+    try:
+        writer.write(resp)
+        await writer.drain()
+    except Exception:
+        pass
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def start_status_server():
+    """
+    Servidor HTTP ultra-simples de health-check em 0.0.0.0:$PORT.
+    Render só precisa ver que tem alguém escutando nessa porta.
+    """
+    if STATUS_PORT <= 0:
+        logger.info("[status] PORT não definido, status HTTP desativado.")
+        return
+
+    server = await asyncio.start_server(_status_handler, STATUS_HOST, STATUS_PORT)
+    addr = server.sockets[0].getsockname()
+    logger.info(f"[status] Servindo health-check HTTP em http://{addr[0]}:{addr[1]}/")
+
+    async with server:
+        await server.serve_forever()
+
+
 async def arq_startup(ctx: dict):
     """
-    on_startup do ARQ (usado em produção / Render):
+    on_startup do ARQ (usado em produção / Render com `arq main.WorkerSettings`):
       - inicia o proxy redis_ws_tcp_proxy.main() como task
       - espera a porta do proxy abrir
       - cria pool Redis (ctx['log_redis'])
       - prepara Playwright
+      - (opcional) inicia status HTTP se PORT estiver definido
     """
-    global _proxy_task
+    global _proxy_task, _status_task
     logger.info(f"[worker] iniciando com id={WORKER_ID}")
 
     if IS_RENDER:
@@ -508,6 +562,7 @@ async def arq_startup(ctx: dict):
     os.makedirs(BASE_DIR, exist_ok=True)
     await browser_get()
 
+    # Proxy Redis (TCP->WS)
     if os.getenv("START_REDIS_PROXY", "1") == "1":
         if _proxy_task is None:
             logger.info("[proxy] iniciando proxy (on_startup)...")
@@ -518,6 +573,13 @@ async def arq_startup(ctx: dict):
         except Exception as exc:
             logger.error(f"[proxy] falha ao esperar porta do proxy: {exc}")
             raise
+
+    # Servidor HTTP de status (apenas se PORT definido)
+    if STATUS_PORT > 0 and _status_task is None:
+        try:
+            _status_task = asyncio.create_task(start_status_server())
+        except Exception as exc:
+            logger.error(f"[status] falha ao iniciar servidor HTTP: {exc}")
 
     ctx["log_redis"] = await create_pool(REDIS_SETTINGS)
     ctx["base_dir"] = BASE_DIR
@@ -530,6 +592,8 @@ async def arq_shutdown(ctx: dict):
     """
     on_shutdown do ARQ
     """
+    global _status_task
+
     try:
         redis = ctx.get("log_redis")
         if redis:
@@ -538,6 +602,13 @@ async def arq_shutdown(ctx: dict):
         pass
 
     await browser_close()
+
+    if _status_task:
+        try:
+            _status_task.cancel()
+        except Exception:
+            pass
+
     logger.info("[arq] shutdown concluído")
 
 
@@ -668,9 +739,13 @@ def run_arq_subprocess():
     Inicia `arq main.WorkerSettings` em subprocess.
     Útil para desenvolvimento (python main.py).
     """
+    # No subprocess, NÃO vamos subir proxy de novo
+    env = os.environ.copy()
+    env["START_REDIS_PROXY"] = "0"
+
     cmd = ["arq", "main.WorkerSettings"]
     logger.info(f"[dev] executando subprocess: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd)
+    proc = subprocess.Popen(cmd, env=env)
     try:
         proc.wait()
     except KeyboardInterrupt:
@@ -686,13 +761,24 @@ def run_arq_subprocess():
 async def _dev_main_async():
     """
     1) Inicia proxy em background (no mesmo processo)
-    2) Aguarda porta
-    3) Roda subprocess `arq main.WorkerSettings`
+    2) (opcional) Inicia HTTP status server
+    3) Aguarda proxy
+    4) Roda subprocess `arq main.WorkerSettings`
     """
     logger.info("[dev] iniciando proxy (modo dev)...")
 
-    # Sobe o proxy como task no mesmo loop
+    # Proxy Redis local (TCP->WS)
     proxy_task = asyncio.create_task(redis_ws_tcp_proxy.main())
+
+    # HTTP status (health) no processo principal (Render enxerga aqui)
+    status_task = None
+    if STATUS_PORT > 0:
+        try:
+            status_task = asyncio.create_task(start_status_server())
+        except Exception as exc:
+            logger.error(f"[status] falha ao iniciar servidor HTTP (dev): {exc}")
+    else:
+        logger.info("[status] PORT não definido; status HTTP desativado (dev).")
 
     # Espera a porta do proxy abrir
     try:
@@ -700,17 +786,25 @@ async def _dev_main_async():
     except Exception as exc:
         logger.error(f"[dev] proxy não ficou pronto: {exc}")
         proxy_task.cancel()
+        if status_task:
+            status_task.cancel()
         raise
 
     # Agora roda o ARQ em subprocess (bloqueante, então vai pra thread)
     loop = asyncio.get_running_loop()
     rc = await loop.run_in_executor(None, run_arq_subprocess)
 
-    # Quando o subprocess sai, cancelamos o proxy e encerramos
+    # Quando o subprocess sai, cancelamos proxy e status e encerramos
     try:
         proxy_task.cancel()
     except Exception:
         pass
+
+    if status_task:
+        try:
+            status_task.cancel()
+        except Exception:
+            pass
 
     return rc
 
@@ -723,9 +817,11 @@ if __name__ == "__main__":
     # DEV:
     #   python main.py
     #
-    # PRODUÇÃO (Render):
+    # PRODUÇÃO (Render Web Service):
+    #   Start Command:  python main.py
+    #
+    # PRODUÇÃO (Render Background Worker):
     #   Start Command:  arq main.WorkerSettings
-    #   (não entra aqui; o ARQ só importa o módulo)
     if os.getenv("FORCE_ARQ_SUBPROCESS", "") == "1":
         # atalho: roda só o arq em subprocess, sem proxy (pra testes específicos)
         sys.exit(run_arq_subprocess())
