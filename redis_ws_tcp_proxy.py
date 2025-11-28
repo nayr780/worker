@@ -1,86 +1,118 @@
 #!/usr/bin/env python3
 """
-TCP -> WebSocket proxy for Redis (preserva RESP frames).
+TCP -> WebSocket proxy for Redis em backends tipo Render.
 
-- Escuta em 127.0.0.1:6380 (config via env REDIS_PROXY_HOST/REDIS_PROXY_PORT)
-- Aceita RESP do cliente (redis-cli / redis-py)
-- Encaminha o FRAME RESP ORIGINAL (bytes) para o upstream WebSocket
-  (permanece fiel aos bulk-strings; NÃO converte para inline)
-- Intercepta COMMAND localmente (para redis-cli não travar)
-- Encaminha respostas do WS de volta pro cliente TCP
+- Escuta em 127.0.0.1:6380 (config via env LOCAL_HOST/LOCAL_PORT)
+- Aceita RESP (redis-cli / ARQ), parseia mensagens completas (suporta pipelining)
+- Converte pra comando inline (nome do comando UPPERCASE)
+- Envia como texto pro WebSocket upstream
+- Intercepta COMMAND localmente (pro redis-cli não travar)
+- Encaminha respostas do WS pro cliente TCP
 """
+
+import os
 import asyncio
 import logging
-import os
-from websockets import connect
 from typing import Tuple, Optional
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from websockets import connect
+
+# ----------------- LOGGING -----------------
+LOG_LEVEL = os.getenv("REDIS_PROXY_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 log = logging.getLogger("redis-proxy")
 
-# CONFIG
+# reduzir ruído da lib websockets
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("websockets.client").setLevel(logging.WARNING)
+logging.getLogger("websockets.asyncio.client").setLevel(logging.WARNING)
+logging.getLogger("websockets.http11").setLevel(logging.WARNING)
+
+# ----------------- CONFIG por ENV -----------------
 WS_URL = os.getenv("REDIS_WS_URL", "wss://redisrender.onrender.com")
-TOKEN = os.getenv("REDIS_TOKEN", "")  # se vazio, sem token
+TOKEN = os.getenv("REDIS_TOKEN", "")  # se não precisar de token, deixe vazio
+
 LOCAL_HOST = os.getenv("REDIS_PROXY_HOST", "127.0.0.1")
 LOCAL_PORT = int(os.getenv("REDIS_PROXY_PORT", "6380"))
+# --------------------------------------------------
+
 
 # ---------- helpers RESP parsing ----------
-def parse_first_resp_message(buf: bytes) -> Tuple[Optional[int], int]:
+def parse_first_resp_message(buf: bytes) -> Tuple[Optional[str], int]:
     """
     Tenta parsear a PRIMEIRA mensagem RESP do buffer `buf`.
-    Se bem-sucedido retorna (start_index, bytes_consumed) sendo start_index normalmente 0.
-    Se incompleto/indecifrável retorna (None, 0).
-
-    NOTA: aqui nós apenas detectamos onde termina a *primeira* mensagem RESP
-    (suporta arrays de bulk-strings — formato que redis-cli usa).
-    Não montamos inline — vamos enviar os BYTES originais.
+    Se bem-sucedido retorna (inline_cmd_str, bytes_consumed).
+    Se incomplete/indecifrável retorna (None, 0).
+    Suporta apenas arrays de bulk-strings (forma padrão do redis-cli).
     """
     if not buf:
         return None, 0
-    # só aceitamos ARRAY (`*<n>\r\n`) — forma usada por redis-cli / clientes RESP
-    if buf[0:1] != b'*':
+    if buf[0:1] != b"*":
+        # Não é uma mensagem RESP por array — ignoramos (redis-py usa RESP).
         return None, 0
+
+    # encontra fim da primeira linha "*<n>\r\n"
     pos = buf.find(b"\r\n")
     if pos == -1:
         return None, 0
     try:
-        num_args = int(buf[1:pos].decode(errors="ignore"))
+        num_args = int(buf[1:pos].decode())
     except Exception:
         return None, 0
+
     idx = pos + 2
+    args = []
     for _ in range(num_args):
         if idx >= len(buf):
             return None, 0
-        if buf[idx:idx+1] != b'$':
+        if buf[idx:idx + 1] != b"$":
             return None, 0
         pos2 = buf.find(b"\r\n", idx)
         if pos2 == -1:
             return None, 0
         try:
-            arg_len = int(buf[idx+1:pos2].decode(errors="ignore"))
+            arg_len = int(buf[idx + 1:pos2].decode())
         except Exception:
             return None, 0
         idx = pos2 + 2
-        # falta bytes do argumento + CRLF?
         if len(buf) < idx + arg_len + 2:
             return None, 0
+        arg = buf[idx: idx + arg_len]
+        try:
+            args.append(arg.decode("utf-8", errors="ignore"))
+        except Exception:
+            args.append(arg.decode("latin1", errors="ignore"))
         idx += arg_len
-        # verificar CRLF final do bulk
-        if buf[idx:idx+2] != b"\r\n":
+        # esperar CRLF
+        if buf[idx:idx + 2] != b"\r\n":
             return None, 0
         idx += 2
-    # idx agora aponta pra primeira posição após a mensagem completa
-    return 0, idx
+
+    # montar inline command (primeira palavra uppercase)
+    if not args:
+        return None, idx
+    inline = " ".join(args)
+    parts = inline.split(" ", 1)
+    name = parts[0].upper()
+    inline_cmd = name if len(parts) == 1 else name + " " + parts[1]
+    return inline_cmd, idx
+
 
 def fake_command_response_bytes() -> bytes:
-    """Resposta simples para o comando COMMAND (suficiente para redis-cli)."""
-    # Array vazio RESP
+    """
+    Resposta simples para o comando COMMAND (suficiente para redis-cli).
+    """
+    # Array vazio (redis-cli aceita).
     return b"*0\r\n"
+
 
 # ---------- handler por cliente TCP ----------
 async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
-    log.info(f"[TCP] Cliente conectado: {peer}")
+    log.debug(f"[TCP] Cliente conectado: {peer}")
 
     # conecta ao WebSocket upstream
     ws_url = f"{WS_URL}?token={TOKEN}" if TOKEN else WS_URL
@@ -96,6 +128,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
 
     log.info(f"[WS] Conectado ao upstream: {ws_url}")
 
+    # buffers / tasks
     tcp_buffer = bytearray()
 
     async def tcp_reader_loop():
@@ -104,55 +137,30 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
             while True:
                 data = await reader.read(4096)
                 if not data:
-                    log.info("[TCP] Cliente fechou a conexão")
+                    log.debug("[TCP] Cliente fechou a conexão")
                     break
                 tcp_buffer.extend(data)
-                # tenta extrair mensagens RESP completas e repassá-las INTEIRAS (bytes)
+                # tenta extrair e processar todas as mensagens RESP completas no buffer
                 while True:
-                    start, consumed = parse_first_resp_message(bytes(tcp_buffer))
-                    if consumed == 0 or start is None:
+                    cmd, consumed = parse_first_resp_message(bytes(tcp_buffer))
+                    if consumed == 0 or cmd is None:
                         break
-                    # pega o slice exato RESP (preserva bulk-strings com espaços)
-                    outbound_bytes = bytes(tcp_buffer[:consumed])
-                    # remove do buffer
+                    # remove bytes consumidos
                     del tcp_buffer[:consumed]
 
-                    # Se for comando COMMAND (por segurança, sniff), devolve fake response local
-                    # Vamos inspecionar o *início* do frame (não textual): por simplicidade,
-                    # convertendo a primeira bulk-string (o nome do comando).
-                    try:
-                        # parse rápido do nome do comando (primeiro bulk-string)
-                        # forma: *N\r\n$len\r\nCOMMAND\r\n...
-                        # buscamos primeiro '$' após '*' e então pegar os bytes do primeiro bulk
-                        buf = outbound_bytes
-                        p = buf.find(b'\r\n')
-                        # p aponta fim de "*N\r\n"
-                        # achar next '$' (começo do bulk)
-                        q = buf.find(b'\r\n', p+2)
-                        # find the start of the bulk content
-                        # but simplest is to find the first occurrence of b'\r\n' after the $len line,
-                        # then extract the command name bytes between that and the following \r\n.
-                        # fallback: try decode safely
-                        # We'll do a safer decode attempt:
-                        parts = buf.split(b'\r\n', 4)
-                        # parts -> [b'*N', b'$len', b'CMD', ...] if present
-                        if len(parts) >= 3:
-                            cmd_name = parts[2].decode(errors='ignore').upper()
-                        else:
-                            cmd_name = ""
-                    except Exception:
-                        cmd_name = ""
+                    log.debug(f"[TCP → WS] {cmd!r}")
 
-                    if cmd_name == "COMMAND":
-                        log.info("[INTERCEPT] Respondendo COMMAND localmente")
+                    # intercepta COMMAND localmente
+                    if cmd.upper() == "COMMAND":
+                        log.debug("[INTERCEPT] Respondendo COMMAND localmente")
                         writer.write(fake_command_response_bytes())
                         await writer.drain()
                         continue
 
-                    # envia os BYTES RESP originais para o WS (binary)
+                    # envia para WS como texto + CRLF
+                    outbound = cmd + "\r\n"
                     try:
-                        await ws.send(outbound_bytes)  # envia bytes, preservando o RESP
-                        log.debug(f"[TCP → WS] forwarded {len(outbound_bytes)} bytes (RESP preserved)")
+                        await ws.send(outbound)
                     except Exception as e:
                         log.error(f"[WS] Erro ao enviar: {e}")
                         raise
@@ -175,9 +183,17 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
             async for msg in ws:
                 # msg pode ser str (texto) ou bytes (binary)
                 if isinstance(msg, str):
-                    b = msg.encode()
+                    s = msg
+                    # garantir CRLF para o cliente redis-cli
+                    if not s.endswith("\r\n"):
+                        s = s + "\r\n"
+                    b = s.encode()
                 else:
+                    # bytes - encaminha tal qual (mas se não terminar em CRLF, append)
                     b = bytes(msg)
+                    if not b.endswith(b"\r\n"):
+                        b = b + b"\r\n"
+                log.debug(f"[WS → TCP] {b!r}")
                 try:
                     writer.write(b)
                     await writer.drain()
@@ -191,16 +207,18 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
         finally:
             try:
                 writer.close()
-                await writer.wait_closed()
             except Exception:
                 pass
 
+    # criar tarefas e aguardar conclusão (qualquer uma das duas fechando termina a sessão)
     task_tcp = asyncio.create_task(tcp_reader_loop())
     task_ws = asyncio.create_task(ws_reader_loop())
+
     done, pending = await asyncio.wait([task_tcp, task_ws], return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
         t.cancel()
 
+    # cleanup
     try:
         await ws.close()
     except Exception:
@@ -211,16 +229,19 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
     except Exception:
         pass
 
-    log.info(f"[SESSION] encerrada para {peer}")
+    log.debug(f"[SESSION] encerrada para {peer}")
+
 
 # ---------- servidor TCP ----------
 async def main():
     server = await asyncio.start_server(handle_tcp_client, LOCAL_HOST, LOCAL_PORT)
     addr = server.sockets[0].getsockname()
     log.info(f"Proxy escutando em tcp://{addr[0]}:{addr[1]}")
-    log.info(f"Upstream WS: {WS_URL}  token={'<SET>' if TOKEN else '<NONE>'}")
+    log.info(f"Upstream WS: {WS_URL}  token={'<SET' if TOKEN else '<NONE>'}")
+
     async with server:
         await server.serve_forever()
+
 
 if __name__ == "__main__":
     try:
