@@ -2,11 +2,17 @@
 """
 TCP -> WebSocket proxy para Redis.
 
-- Escuta em LOCAL_HOST:LOCAL_PORT (config via env REDIS_PROXY_HOST/REDIS_PROXY_PORT)
+- Escuta em LOCAL_HOST:LOCAL_PORT (env: REDIS_PROXY_HOST / REDIS_PROXY_PORT)
 - Aceita clientes Redis (redis-py / ARQ / redis-cli)
-- Encaminha bytes brutos via WebSocket para um serviço WS upstream
-  (ex: seu serviço em Render que fala WS <-> Redis TCP).
-- Não parseia RESP, não converte pra "inline", não altera comandos.
+- Encaminha bytes crus via WebSocket para um serviço WS upstream
+  (ex: seu serviço em Render que faz WS <-> Redis TCP).
+- NÃO parseia RESP, NÃO converte comando, NÃO mexe em nada.
+
+Além disso:
+- Só abre WebSocket para o upstream DEPOIS de receber algum byte do cliente.
+  Isso evita abrir WS para scanners de porta do Render que conectam
+  e fecham sem mandar nada.
+- Logs de conexão/desconexão estão em nível DEBUG; por padrão o LOG é WARNING.
 """
 
 import os
@@ -17,9 +23,9 @@ from typing import Optional
 from websockets import connect
 
 # ----------------- LOGGING -----------------
-LOG_LEVEL = os.getenv("REDIS_PROXY_LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("REDIS_PROXY_LOG_LEVEL", "WARNING").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, LOG_LEVEL, logging.WARNING),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("redis-proxy")
@@ -41,13 +47,39 @@ LOCAL_PORT = int(os.getenv("REDIS_PROXY_PORT", "6380"))
 
 async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
-    log.info(f"[TCP] Cliente conectado: {peer}")
+    log.debug(f"[TCP] Cliente conectado: {peer}")
 
+    # 1) Primeiro, espera receber ALGUM dado do cliente.
+    #    Se o cliente conectar e fechar sem mandar nada (scanner de porta),
+    #    a gente NÃO abre WebSocket pro upstream.
+    try:
+        first_chunk = await reader.read(4096)
+    except Exception as e:
+        log.debug(f"[TCP] erro ao ler primeiro chunk de {peer}: {e}")
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
+
+    if not first_chunk:
+        # Cliente conectou e fechou sem mandar nada -> provavelmente scanner.
+        log.debug(f"[TCP] {peer} fechou sem enviar dados (ignorando, sem WS).")
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
+
+    # 2) Agora sim, abre WebSocket pro upstream.
     ws_url = f"{WS_URL}?token={TOKEN}" if TOKEN else WS_URL
     try:
         ws = await connect(ws_url)
     except Exception as e:
-        log.error(f"[WS] Falha ao conectar ao WS upstream: {e}")
+        log.error(f"[WS] Falha ao conectar ao WS upstream {ws_url}: {e}")
+        # responde erro estilo Redis pro cliente
         try:
             writer.write(b"-ERR cannot connect to upstream\r\n")
             await writer.drain()
@@ -60,21 +92,20 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
             pass
         return
 
-    log.info(f"[WS] Conectado ao upstream: {ws_url}")
+    log.debug(f"[WS] Conectado ao upstream: {ws_url}")
 
     async def tcp_to_ws():
+        # já temos o primeiro chunk, envia ele antes
         try:
-            while True:
-                data = await reader.read(4096)
-                if not data:
-                    log.debug("[TCP] EOF do cliente")
-                    break
-                # manda bytes crus pro WS (binary frame)
+            data = first_chunk
+            while data:
                 await ws.send(data)
+                data = await reader.read(4096)
+            log.debug(f"[TCP] EOF do cliente {peer}")
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.error(f"[tcp_to_ws] erro: {e}")
+            log.debug(f"[tcp_to_ws] erro {peer}: {e}")
         finally:
             try:
                 await ws.close()
@@ -88,7 +119,6 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
     async def ws_to_tcp():
         try:
             async for msg in ws:
-                # msg pode ser str ou bytes
                 if isinstance(msg, str):
                     data = msg.encode("utf-8", errors="ignore")
                 else:
@@ -98,7 +128,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.error(f"[ws_to_tcp] erro: {e}")
+            log.debug(f"[ws_to_tcp] erro {peer}: {e}")
         finally:
             try:
                 writer.close()
@@ -113,7 +143,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
     for t in pending:
         t.cancel()
 
-    log.info(f"[SESSION] encerrada para {peer}")
+    log.debug(f"[SESSION] encerrada para {peer}")
 
 
 async def main():
