@@ -1,0 +1,11 @@
+playwright
+arq
+redis
+pydantic
+python-dotenv
+pcloud
+Pillow
+requests
+playwright
+redis
+pcloud
